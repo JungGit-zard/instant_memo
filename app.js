@@ -356,16 +356,16 @@ function formatDateDisplay(dateStr) {
     return dateStr.replace(/-/g, '. ');
 }
 
-function carryOverIncompleteTasks() {
-    const today = getKSTDateString(new Date());
+function carryOverIncompleteTasks(targetDate = getKSTDateString(new Date())) {
+    applyMemoTombstones(allMemos);
     const sortedDates = Object.keys(allMemos).sort((a, b) => b.localeCompare(a));
-    const pastDates = sortedDates.filter((dateKey) => dateKey < today);
+    const pastDates = sortedDates.filter((dateKey) => dateKey < targetDate);
 
     if (pastDates.length === 0) return;
 
     let changed = false;
-    if (!Array.isArray(allMemos[today])) {
-        allMemos[today] = [];
+    if (!Array.isArray(allMemos[targetDate])) {
+        allMemos[targetDate] = [];
     }
 
     const latestTaskState = {};
@@ -386,17 +386,20 @@ function carryOverIncompleteTasks() {
         if (latest.completed) return;
 
         const taskKey = getMemoLineageKey(latest.originalTask);
-        const alreadyInToday = allMemos[today].some((task) => getMemoLineageKey(task) === taskKey);
+        if (memoTombstones[taskKey]) return;
 
-        if (!alreadyInToday) {
-            allMemos[today].push(createCarriedMemo(latest.originalTask, latest.date));
+        const alreadyInTargetDate = allMemos[targetDate].some((task) => getMemoLineageKey(task) === taskKey);
+        const sameContentInTargetDate = hasMemoWithSameContent(targetDate, latest.originalTask.text);
+
+        if (!alreadyInTargetDate && !sameContentInTargetDate) {
+            allMemos[targetDate].push(createCarriedMemo(latest.originalTask, latest.date, targetDate));
             changed = true;
             log(`Carried over incomplete: ${latest.originalTask.text}`);
         }
     });
 
     if (changed) {
-        sortMemoBucket(today);
+        sortMemoBucket(targetDate);
         saveMemos();
     }
 }
@@ -492,6 +495,11 @@ function addMemo() {
         allMemos[selectedDate] = [];
     }
 
+    if (hasMemoWithSameContent(selectedDate, text)) {
+        memoInput.focus();
+        return;
+    }
+
     allMemos[selectedDate].unshift(createMemo(text, selectedDate));
     sortMemos(true);
     updateStats();
@@ -524,19 +532,10 @@ function deleteMemo(index) {
 
     const target = allMemos[selectedDate][index];
     const targetOriginId = getMemoLineageKey(target);
-    addMemoTombstone(targetOriginId);
-
-    Object.keys(allMemos).forEach((dateKey) => {
-        if (Array.isArray(allMemos[dateKey])) {
-            allMemos[dateKey] = allMemos[dateKey].filter((memo) => getMemoLineageKey(memo) !== targetOriginId);
-        }
-    });
+    removeMemoLineageForever(targetOriginId);
 
     log(`SCRUBBED FOREVER: ${target.text}`);
-    saveMemoTombstones();
-    saveMemos();
-    renderMemos();
-    updateStats();
+    persistPermanentMemoRemoval();
 }
 
 function clearCompleted() {
@@ -569,14 +568,15 @@ function confirmEdit() {
 
     if (newText === '') {
         if (confirm('메모 내용이 비어 있습니다. 이 메모를 삭제할까요?')) {
-            addMemoTombstone(getMemoLineageKey(allMemos[selectedDate][currentEditItemIndex]));
-            allMemos[selectedDate].splice(currentEditItemIndex, 1);
-            saveMemoTombstones();
-            saveMemos();
-            renderMemos();
-            updateStats();
+            removeMemoLineageForever(getMemoLineageKey(allMemos[selectedDate][currentEditItemIndex]));
+            persistPermanentMemoRemoval();
             closeEditModal();
         }
+        return;
+    }
+
+    if (hasMemoWithSameContent(selectedDate, newText, allMemos[selectedDate][currentEditItemIndex].id)) {
+        editMemoInput.focus();
         return;
     }
 
@@ -616,8 +616,7 @@ function confirmArchive() {
         updatedAt: timestamp
     });
 
-    addMemoTombstone(getMemoLineageKey(memo));
-    allMemos[selectedDate].splice(currentArchiveItemIndex, 1);
+    removeMemoLineageForever(getMemoLineageKey(memo));
 
     saveMemoTombstones();
     saveMemos();
@@ -929,6 +928,7 @@ function changeDate(days) {
     const date = new Date(`${selectedDate}T00:00:00+09:00`);
     date.setUTCDate(date.getUTCDate() + days);
     selectedDate = getKSTDateString(date);
+    carryOverIncompleteTasks(selectedDate);
     updateDateDisplay();
     renderMemos();
     updateStats();
@@ -1220,6 +1220,21 @@ function getMemoLineageKey(memo) {
     return memo?.originId || memo?.id || '';
 }
 
+function getMemoContentKey(value) {
+    const text = typeof value === 'string' ? value : value?.text;
+    return typeof text === 'string' ? text.trim() : '';
+}
+
+function hasMemoWithSameContent(dateKey, text, excludedMemoId = '') {
+    const contentKey = getMemoContentKey(text);
+    if (!contentKey || !Array.isArray(allMemos[dateKey])) return false;
+
+    return allMemos[dateKey].some((memo) => {
+        if (excludedMemoId && memo.id === excludedMemoId) return false;
+        return getMemoContentKey(memo) === contentKey;
+    });
+}
+
 function addMemoTombstone(lineageKey) {
     if (!lineageKey) return;
     memoTombstones[lineageKey] = nowIso();
@@ -1261,6 +1276,31 @@ function applyMemoTombstones(sourceMap) {
     });
 
     return changed;
+}
+
+function removeMemoLineageForever(lineageKey) {
+    if (!lineageKey) return false;
+
+    addMemoTombstone(lineageKey);
+    let changed = false;
+
+    Object.keys(allMemos).forEach((dateKey) => {
+        const bucket = Array.isArray(allMemos[dateKey]) ? allMemos[dateKey] : [];
+        const filteredBucket = bucket.filter((memo) => getMemoLineageKey(memo) !== lineageKey);
+        if (filteredBucket.length !== bucket.length) {
+            allMemos[dateKey] = filteredBucket;
+            changed = true;
+        }
+    });
+
+    return changed;
+}
+
+function persistPermanentMemoRemoval() {
+    saveMemoTombstones();
+    saveMemos();
+    renderMemos();
+    updateStats();
 }
 
 function filterArchivesWithTombstones(items) {
@@ -1306,6 +1346,31 @@ function dedupeMemoMapByLineage(sourceMap) {
         });
 
         const dedupedBucket = Array.from(bucketByLineage.values());
+        sortMemoBucket(dateKey, { [dateKey]: dedupedBucket });
+
+        if (dedupedBucket.length !== bucket.length || JSON.stringify(dedupedBucket) !== JSON.stringify(bucket)) {
+            sourceMap[dateKey] = dedupedBucket;
+            changed = true;
+        }
+    });
+
+    return changed;
+}
+
+function dedupeMemoMapByContent(sourceMap) {
+    let changed = false;
+
+    Object.keys(sourceMap).forEach((dateKey) => {
+        const bucket = Array.isArray(sourceMap[dateKey]) ? sourceMap[dateKey] : [];
+        const bucketByContent = new Map();
+
+        bucket.forEach((memo) => {
+            const contentKey = getMemoContentKey(memo);
+            if (!contentKey) return;
+            bucketByContent.set(contentKey, chooseLatest(bucketByContent.get(contentKey), memo));
+        });
+
+        const dedupedBucket = Array.from(bucketByContent.values());
         sortMemoBucket(dateKey, { [dateKey]: dedupedBucket });
 
         if (dedupedBucket.length !== bucket.length || JSON.stringify(dedupedBucket) !== JSON.stringify(bucket)) {
@@ -1377,7 +1442,9 @@ function stabilizeMemoMap(sourceMap) {
         });
     });
 
-    return dedupeMemoMapByLineage(sourceMap) || changed;
+    const dedupedByLineage = dedupeMemoMapByLineage(sourceMap);
+    const dedupedByContent = dedupeMemoMapByContent(sourceMap);
+    return dedupedByLineage || dedupedByContent || changed;
 }
 
 function chooseLatest(remoteItem, localItem) {
@@ -1716,6 +1783,11 @@ function addMemo() {
         allMemos[selectedDate] = [];
     }
 
+    if (hasMemoWithSameContent(selectedDate, text)) {
+        memoInput.focus();
+        return;
+    }
+
     allMemos[selectedDate].push(createMemo(text, selectedDate));
     sortMemos(true);
     updateStats();
@@ -1750,19 +1822,10 @@ function deleteMemo(memoId) {
 
     const target = allMemos[selectedDate][index];
     const targetOriginId = getMemoLineageKey(target);
-    addMemoTombstone(targetOriginId);
-
-    Object.keys(allMemos).forEach((dateKey) => {
-        if (Array.isArray(allMemos[dateKey])) {
-            allMemos[dateKey] = allMemos[dateKey].filter((memo) => getMemoLineageKey(memo) !== targetOriginId);
-        }
-    });
+    removeMemoLineageForever(targetOriginId);
 
     log(`SCRUBBED FOREVER: ${target.text}`);
-    saveMemoTombstones();
-    saveMemos();
-    renderMemos();
-    updateStats();
+    persistPermanentMemoRemoval();
 }
 
 function openEditModal(memoId) {
@@ -1792,14 +1855,15 @@ function confirmEdit() {
 
     if (newText === '') {
         if (confirm('Memo is empty. Delete this memo?')) {
-            addMemoTombstone(getMemoLineageKey(allMemos[selectedDate][memoIndex]));
-            allMemos[selectedDate].splice(memoIndex, 1);
-            saveMemoTombstones();
-            saveMemos();
-            renderMemos();
-            updateStats();
+            removeMemoLineageForever(getMemoLineageKey(allMemos[selectedDate][memoIndex]));
+            persistPermanentMemoRemoval();
             closeEditModal();
         }
+        return;
+    }
+
+    if (hasMemoWithSameContent(selectedDate, newText, allMemos[selectedDate][memoIndex].id)) {
+        editMemoInput.focus();
         return;
     }
 
@@ -1847,8 +1911,7 @@ function confirmArchive() {
         updatedAt: timestamp
     });
 
-    addMemoTombstone(getMemoLineageKey(memo));
-    allMemos[selectedDate].splice(memoIndex, 1);
+    removeMemoLineageForever(getMemoLineageKey(memo));
 
     saveMemoTombstones();
     saveMemos();
@@ -2106,6 +2169,7 @@ prevDateBtn.addEventListener('click', () => changeDate(-1));
 nextDateBtn.addEventListener('click', () => changeDate(1));
 datePicker.addEventListener('change', (event) => {
     selectedDate = event.target.value;
+    carryOverIncompleteTasks(selectedDate);
     updateDateDisplay();
     renderMemos();
     updateStats();
