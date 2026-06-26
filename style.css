@@ -334,11 +334,18 @@ h1 {
     font-weight: 300;
 }
 
+.sync-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+}
+
 .sync-status {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    margin-top: 12px;
     padding: 6px 10px;
     border-radius: 999px;
     border: 1px solid var(--border);
@@ -366,6 +373,24 @@ h1 {
 .sync-status[data-mode="local-only"]::before,
 .sync-status[data-mode="error"]::before {
     background: #ef4444;
+}
+
+.sync-share-btn {
+    min-height: 30px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: rgba(99, 102, 241, 0.12);
+    color: var(--text-main);
+    font: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+    transition: transform 0.2s ease, background-color 0.2s ease;
+}
+
+.sync-share-btn:hover {
+    transform: translateY(-1px);
+    background: rgba(99, 102, 241, 0.22);
 }
 
 /* Input Section */

@@ -64,9 +64,26 @@ function getOrCreateSyncNamespace() {
 }
 
 const syncNamespace = getOrCreateSyncNamespace();
+const LEGACY_SYNC_MIRROR_ENABLED = true;
 
 function syncRef(path) {
     return db.ref(`namespaces/${syncNamespace}/${path}`);
+}
+
+function legacySyncRef(path) {
+    return db.ref(path);
+}
+
+function writeSyncPath(path, value) {
+    const primaryWrite = syncRef(path).set(value);
+    if (LEGACY_SYNC_MIRROR_ENABLED) {
+        primaryWrite.then(() => {
+            legacySyncRef(path).set(value).catch((error) => {
+                console.warn(`[MemoApp] Legacy mirror write failed for ${path}.`, error);
+            });
+        });
+    }
+    return primaryWrite;
 }
 
 const memoInput = document.getElementById('memoInput');
@@ -76,6 +93,7 @@ const activeCount = document.getElementById('activeCount');
 const clearCompletedBtn = document.getElementById('clearCompleted');
 const sortBtn = document.getElementById('sortBtn');
 const syncStatus = document.getElementById('syncStatus');
+const syncShareBtn = document.getElementById('syncShareBtn');
 
 const dateText = document.getElementById('dateText');
 const dayText = document.getElementById('dayText');
@@ -246,6 +264,7 @@ function startSync() {
             || JSON.stringify(remoteMemos) !== JSON.stringify(mergedMemos);
 
         allMemos = mergedMemos;
+        writeLocalStorage('allMemos', allMemos);
         initialMemosLoaded = true;
 
         maybeResolveInitialSync();
@@ -273,6 +292,7 @@ function startSync() {
             || JSON.stringify(remoteArchives) !== JSON.stringify(filteredArchives);
 
         archivedMemos = filteredArchives;
+        writeLocalStorage('archivedMemos', archivedMemos);
         initialArchivesLoaded = true;
         maybeResolveInitialSync();
 
@@ -284,6 +304,86 @@ function startSync() {
         initialArchivesLoaded = true;
         handleSyncError('Archive sync unavailable', error);
         maybeResolveInitialSync();
+    });
+
+    startLegacyMirrorSync();
+}
+
+function startLegacyMirrorSync() {
+    if (!LEGACY_SYNC_MIRROR_ENABLED) return;
+
+    legacySyncRef('memoTombstones').on('value', (snapshot) => {
+        const legacyTombstones = normalizeTombstoneMap(snapshot.val());
+        const mergedTombstones = mergeTombstoneMaps(legacyTombstones, memoTombstones);
+        if (JSON.stringify(mergedTombstones) === JSON.stringify(memoTombstones)) return;
+
+        memoTombstones = mergedTombstones;
+        writeLocalStorage('memoTombstones', memoTombstones);
+        if (applyMemoTombstones(allMemos)) {
+            writeLocalStorage('allMemos', allMemos);
+            pendingMemoSync = true;
+        }
+        pendingMemoTombstoneSync = true;
+        flushPendingRemoteSync();
+        renderMemos();
+        updateStats();
+    }, (error) => {
+        console.warn('[MemoApp] Legacy memo deletion mirror unavailable', error);
+    });
+
+    legacySyncRef('archiveTombstones').on('value', (snapshot) => {
+        const legacyTombstones = normalizeTombstoneMap(snapshot.val());
+        const mergedTombstones = mergeTombstoneMaps(legacyTombstones, archiveTombstones);
+        if (JSON.stringify(mergedTombstones) === JSON.stringify(archiveTombstones)) return;
+
+        archiveTombstones = mergedTombstones;
+        writeLocalStorage('archiveTombstones', archiveTombstones);
+        if (applyArchiveTombstones()) {
+            writeLocalStorage('archivedMemos', archivedMemos);
+            pendingArchiveSync = true;
+        }
+        pendingArchiveTombstoneSync = true;
+        flushPendingRemoteSync();
+    }, (error) => {
+        console.warn('[MemoApp] Legacy archive deletion mirror unavailable', error);
+    });
+
+    legacySyncRef('allMemos').on('value', (snapshot) => {
+        const legacyMemos = normalizeMemoMap(snapshot.val());
+        const mergedMemos = mergeMemoMaps(legacyMemos, allMemos);
+        const repairedMergedMemos = stabilizeMemoMap(mergedMemos);
+        const removedMergedMemos = applyMemoTombstones(mergedMemos);
+        const changed = repairedMergedMemos
+            || removedMergedMemos
+            || JSON.stringify(mergedMemos) !== JSON.stringify(allMemos);
+
+        if (!changed) return;
+
+        allMemos = mergedMemos;
+        writeLocalStorage('allMemos', allMemos);
+        pendingMemoSync = true;
+        flushPendingRemoteSync();
+        renderMemos();
+        updateStats();
+    }, (error) => {
+        console.warn('[MemoApp] Legacy memo mirror unavailable', error);
+    });
+
+    legacySyncRef('archivedMemos').on('value', (snapshot) => {
+        const legacyArchives = normalizeArchiveCollection(snapshot.val());
+        const mergedArchives = mergeArchiveCollections(legacyArchives, archivedMemos);
+        const filteredArchives = filterArchivesWithTombstones(mergedArchives);
+        const changed = filteredArchives.length !== archivedMemos.length
+            || JSON.stringify(filteredArchives) !== JSON.stringify(archivedMemos);
+
+        if (!changed) return;
+
+        archivedMemos = filteredArchives;
+        writeLocalStorage('archivedMemos', archivedMemos);
+        pendingArchiveSync = true;
+        flushPendingRemoteSync();
+    }, (error) => {
+        console.warn('[MemoApp] Legacy archive mirror unavailable', error);
     });
 }
 
@@ -639,7 +739,7 @@ function saveArchivedMemos() {
         return;
     }
 
-    syncRef('archivedMemos').set(archivedMemos).then(() => {
+    writeSyncPath('archivedMemos', archivedMemos).then(() => {
         setSyncStatus('online', 'Sync connected');
     }).catch((error) => {
         pendingArchiveSync = true;
@@ -870,7 +970,7 @@ function saveMemos() {
         return;
     }
 
-    syncRef('allMemos').set(allMemos).then(() => {
+    writeSyncPath('allMemos', allMemos).then(() => {
         setSyncStatus('online', 'Sync connected');
     }).catch((error) => {
         pendingMemoSync = true;
@@ -890,7 +990,7 @@ function saveMemoTombstones() {
         return;
     }
 
-    syncRef('memoTombstones').set(memoTombstones).then(() => {
+    writeSyncPath('memoTombstones', memoTombstones).then(() => {
         setSyncStatus('online', 'Sync connected');
     }).catch((error) => {
         pendingMemoTombstoneSync = true;
@@ -910,7 +1010,7 @@ function saveArchiveTombstones() {
         return;
     }
 
-    syncRef('archiveTombstones').set(archiveTombstones).then(() => {
+    writeSyncPath('archiveTombstones', archiveTombstones).then(() => {
         setSyncStatus('online', 'Sync connected');
     }).catch((error) => {
         pendingArchiveTombstoneSync = true;
@@ -1527,6 +1627,65 @@ function setSyncStatus(mode, text) {
     syncStatus.dataset.mode = mode;
 }
 
+function getCurrentSyncUrl() {
+    const url = new URL(window.location.href);
+    url.searchParams.set(SYNC_NAMESPACE_QUERY_KEY, syncNamespace);
+    return url.toString();
+}
+
+async function getMobileSyncUrl() {
+    if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+        try {
+            const response = await fetch(`/sync-info?ns=${encodeURIComponent(syncNamespace)}`, {
+                cache: 'no-store'
+            });
+            if (response.ok) {
+                const payload = await response.json();
+                const [mobileUrl] = Array.isArray(payload.urls) ? payload.urls : [];
+                if (mobileUrl) return mobileUrl;
+            }
+        } catch (error) {
+            console.warn('[MemoApp] Failed to resolve LAN sync URL from local server.', error);
+        }
+    }
+
+    return getCurrentSyncUrl();
+}
+
+async function copyTextToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return;
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '-9999px';
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand('copy');
+    textarea.remove();
+}
+
+async function copyMobileSyncLink() {
+    if (!syncShareBtn) return;
+
+    const originalText = syncShareBtn.textContent;
+    try {
+        const mobileSyncUrl = await getMobileSyncUrl();
+        await copyTextToClipboard(mobileSyncUrl);
+        syncShareBtn.textContent = 'Copied';
+        window.setTimeout(() => {
+            syncShareBtn.textContent = originalText;
+        }, 1200);
+    } catch (error) {
+        console.warn('[MemoApp] Failed to copy mobile sync link.', error);
+        window.prompt('Copy this mobile sync link:', await getMobileSyncUrl());
+    }
+}
+
 function handleSyncError(message, error) {
     syncHadError = true;
     console.warn(`[MemoApp] ${message}`, error);
@@ -2125,7 +2284,7 @@ function createMemo(text, dateKey = selectedDate) {
 function createCarriedMemo(sourceMemo, carriedFromDate, targetDate = selectedDate) {
     const timestamp = nowIso();
     const bucket = Array.isArray(allMemos[targetDate]) ? allMemos[targetDate] : [];
-    return {
+    const carriedMemo = {
         ...sourceMemo,
         id: createId(),
         originId: getMemoLineageKey(sourceMemo),
@@ -2133,9 +2292,16 @@ function createCarriedMemo(sourceMemo, carriedFromDate, targetDate = selectedDat
         completed: false,
         carriedFrom: carriedFromDate,
         createdAt: timestamp,
-        updatedAt: timestamp,
-        alarm: sourceMemo.alarm ? { ...sourceMemo.alarm } : undefined
+        updatedAt: timestamp
     };
+
+    if (sourceMemo.alarm) {
+        carriedMemo.alarm = { ...sourceMemo.alarm };
+    } else {
+        delete carriedMemo.alarm;
+    }
+
+    return carriedMemo;
 }
 
 function sortMemoBucket(dateKey, sourceMap = allMemos) {
@@ -2159,8 +2325,10 @@ function sortMemoBucket(dateKey, sourceMap = allMemos) {
 }
 
 addBtn.addEventListener('click', addMemo);
-memoInput.addEventListener('keypress', (event) => {
-    if (event.key === 'Enter') addMemo();
+memoInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || event.isComposing) return;
+    event.preventDefault();
+    addMemo();
 });
 clearCompletedBtn.addEventListener('click', clearCompleted);
 sortBtn.addEventListener('click', () => sortMemos(true, true));
@@ -2203,6 +2371,9 @@ archiveInputModal.addEventListener('click', (event) => {
 });
 
 themeToggle.addEventListener('click', toggleTheme);
+if (syncShareBtn) {
+    syncShareBtn.addEventListener('click', copyMobileSyncLink);
+}
 
 alarmRepeat.addEventListener('change', toggleRepeatOptions);
 cancelAlarmBtn.addEventListener('click', closeAlarmModal);
